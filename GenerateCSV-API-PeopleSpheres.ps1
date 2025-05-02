@@ -23,9 +23,9 @@
         2. Authentication & Token Management
         3. User Data Loading (active/inactive)
         4. Per-user Field Retrieval & Flattening
-        5. CSV Export
-        6. Summary Email Report
-        7. Alert for Unmapped Field IDs
+        5. Unknown Field Handling (formerly Alert for Unmapped Field IDs)
+        6. CSV Export
+        7. Summary Email Report
         8. Error Notification (with log)
         9. Upload to Azure Blob & SQL Bulk Insert
 
@@ -546,8 +546,83 @@ function Get-FlattenedUserData {
 $ResultActive   = Get-FlattenedUserData -UserIds $UserIds_Active   -UserType "active"
 $ResultInactive = Get-FlattenedUserData -UserIds $UserIds_Inactive -UserType "inactive"
 
+# ---------------------------
+# BLOCK 5 : UNKNOWN FIELD HANDLING
+# ---------------------------
+
+# List to store unmapped field IDs with associated user info
+$unmappedFieldDetails = @()
+
+# ID to ignore (service account with elevated access – sees extra internal fields)
+$excludedUserIds = @(529)  # ← This account sees everything, ignore it on purpose
+
+# Re-scan all users (active + inactive) for unmapped field IDs
+foreach ($userId in ($UserIds_Active + $UserIds_Inactive)) {
+    if ($excludedUserIds -contains $userId) {
+        continue  # Skip known service/system accounts
+    }
+
+    try {
+        $url = "$BaseApiUrl/psos/$userId/fields?active=true&include=type,items,options,settings,assignment_settings"
+        $fields = (Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders)).data
+
+        foreach ($item in $fields) {
+            $fieldId = "$($item.id)"
+
+            if (-not $FieldMap.ContainsKey($fieldId)) {
+                $unmappedFieldDetails += [PSCustomObject]@{
+                    UserId   = $userId
+                    FieldId  = $fieldId
+                    Label    = if ($item.label) { $item.label } else { "(empty)" }
+                    Type     = if ($item.type.name) { $item.type.name } else { $item.type.alias }
+                }
+            }
+        }
+    } catch {
+        Write-Warning "⚠️ Failed to scan unmapped fields for user ID $userId"
+    }
+}
+
+# If unmapped fields found (excluding known service account), send a single alert email
+if ($unmappedFieldDetails.Count -gt 0) {
+    $userIdToCheck = $unmappedFieldDetails[0].UserId
+
+    # If the user ID is 529, skip sending the email
+    if ($userIdToCheck -ne 529) {
+        # Start HTML body
+        $alertBody = @"
+<p>🚨 <strong>Unmapped PeopleSpheres Field IDs Detected</strong></p>
+<p>The following field IDs were returned by the API but are not currently handled in the <code>FieldMap</code>.</p>
+<p>Note: Fields returned by service account(s) such as User ID 529 have been intentionally excluded.</p>
+
+<table border="1" cellpadding="5" cellspacing="0">
+<tr><th>User ID</th><th>Field ID</th><th>Label</th><th>Type</th></tr>
+"@
+
+        foreach ($entry in $unmappedFieldDetails) {
+            $alertBody += "<tr><td>$($entry.UserId)</td><td>$($entry.FieldId)</td><td>$($entry.Label)</td><td>$($entry.Type)</td></tr>`n"
+        }
+
+        $alertBody += "</table>
+<p>Please review and update the field mappings if necessary.</p>"
+
+        try {
+            IADAdmin_SendMailMessage -Body $alertBody 
+                                     -To "jeremie.poujol@iadinternational.com" 
+                                     -Subject "[iadlife] 🔎 PeopleSpheres – Unmapped Field IDs Detected" 
+                                     -BodyAsHtml
+            Write-Host "📧 Global alert email sent for unmapped field IDs." -ForegroundColor Magenta
+        } catch {
+            Write-Host "❌ Failed to send unmapped fields alert email: $_" -ForegroundColor Red
+            $script:HadErrors = $true
+        }
+    } else {
+        Write-Host "Skipping email for User ID 529 (service account)." -ForegroundColor Yellow
+    }
+}
+
 # -------------------------------------------------------
-# BLOCK 5 : CSV EXPORT (UTF-8 WITH BOM to avoid encoding issues)
+# BLOCK 6 : CSV EXPORT (UTF-8 WITH BOM to avoid encoding issues)
 # -------------------------------------------------------
 
 # 💡 WHY THIS CHANGE?
@@ -586,7 +661,7 @@ try {
 }
 
 # -------------------------------------------------------
-# BLOCK 6 : EMAIL SENDING (With Summary + ASCII Recap)
+# BLOCK 7 : EMAIL SENDING (With Summary + ASCII Recap)
 # -------------------------------------------------------
 
 # Determine elapsed time
@@ -674,7 +749,7 @@ try {
 }
 
 # -------------------------------------------------------
-# BLOCK 7 : ERROR NOTIFICATION (if any error occurred)
+# BLOCK 8 : ERROR NOTIFICATION (if any error occurred)
 # -------------------------------------------------------
 
 if ($script:HadErrors -and (Test-Path $script:LogPath)) {
@@ -708,7 +783,7 @@ if ($script:HadErrors -and (Test-Path $script:LogPath)) {
 }
 
 # -------------------------------------------------------
-# BLOCK 8 : UPLOAD TO AZURE BLOB + BULK INSERT TO SQL
+# BLOCK 9 : UPLOAD TO AZURE BLOB + BULK INSERT TO SQL
 # -------------------------------------------------------
 
 # Azure and SQL configuration
