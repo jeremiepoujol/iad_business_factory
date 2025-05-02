@@ -381,6 +381,7 @@ if ($IsTestMode) {
 # -------------------------------------------------------
 # BLOCK 4 : PER-USER FIELD RETRIEVAL & FLATTENING
 # -------------------------------------------------------
+# Function to retrieve and flatten user data
 
 # PeopleSpheres field label mapping
 $FieldMapRaw = @{
@@ -409,7 +410,6 @@ foreach ($kvp in $FieldMapRaw.GetEnumerator()) {
     $FieldMap[$kvp.Key] = Normalize-Label $kvp.Value
 }
 
-# Function to retrieve and flatten user data
 function Get-FlattenedUserData {
     param (
         [array]$UserIds,
@@ -441,6 +441,8 @@ function Get-FlattenedUserData {
             $email = ""
             $jobtitle = ""
             $entite = ""
+            $actif = ""
+            $prenomCaractereSpeciaux = ""
 
             foreach ($item in $fields) {
                 $idStr = "$($item.id)"
@@ -449,27 +451,35 @@ function Get-FlattenedUserData {
                 if ($FieldMap.ContainsKey($idStr)) {
                     $key = $FieldMap[$idStr]
 
-                    if ($idStr -eq "182" -and $value -is [psobject]) {
+                    # Null check before accessing value
+                    if ($value -eq $null) {
+                        $userData[$key] = ""
+                    } elseif ($idStr -eq "182" -and $value -is [psobject]) {
                         $userData[$key] = $value.professional_email
+                    } elseif ($idStr -eq "272") {
+                        $userData[$key] = $value  # "Actif" value (Yes/No)
+                    } elseif ($idStr -eq "3657") {
+                        $userData[$key] = $value  # The first name with special characters
                     } elseif ($value -is [array]) {
-                        $userData[$key] = ($value -join ", ")
+                        $userData[$key] = ($value -join ", ")  # Join array values with commas
                     } elseif ($value -is [psobject]) {
-                        $userData[$key] = $value.ToString()
+                        $userData[$key] = $value.ToString()  # Convert psobject to string
                     } else {
-                        $userData[$key] = $value
+                        $userData[$key] = $value  # Default case for other values
                     }
 
-                    # For specific keys, store their data for display
+                    # Adding specific user data
                     switch ($key) {
                         "prenom"         { $prenom  = $userData[$key] }
                         "nom"            { $nom     = $userData[$key] }
                         "adresse_email_professionnelle" { $email = $userData[$key] }
                         "poste"          { $jobtitle = $userData[$key] }
                         "entite_legale"  { $entite  = $userData[$key] }
+                        "actif"          { $actif = $userData[$key] }
+                        "prenom_caracteres_speciaux" { $prenomCaractereSpeciaux = $userData[$key] }
                     }
-                }
-                else {
-                    # Collect any unmapped fields (for later reporting)
+                } else {
+                    # Collect unknown field IDs
                     if (-not $unknownFieldIds.ContainsKey($idStr)) {
                         $unknownFieldIds[$idStr] = @{
                             label = $item.label
@@ -487,18 +497,9 @@ function Get-FlattenedUserData {
                 }
             }
 
-            # 🔤 UTF-8 normalization for string fields
-            foreach ($key in $userData.Keys.Clone()) {
-                if ($userData[$key] -is [string]) {
-                    $userData[$key] = [System.Text.Encoding]::UTF8.GetString(
-                        [System.Text.Encoding]::UTF8.GetBytes($userData[$key])
-                    )
-                }
-            }
-
             $result += [PSCustomObject]$userData
 
-            # Display user block
+            # Debugging output
             $displayBlock = @"
 ------------------------------
 👤 $prenom $nom
@@ -508,8 +509,7 @@ function Get-FlattenedUserData {
 ------------------------------
 "@
             Write-Host $displayBlock -ForegroundColor DarkCyan
-        }
-        catch {
+        } catch {
             $message = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ❌ [$UserType] ERROR for user $userId : $($_.Exception.Message)"
             Write-Host $message -ForegroundColor Red
             Add-Content -Path $script:LogPath -Value $message
@@ -522,21 +522,6 @@ function Get-FlattenedUserData {
             Refresh-AccessToken
             Show-TokenRefreshedBanner -startTime $scriptStartTime -refreshCount $global:TokenRefreshCount
         }
-    }
-
-    # Notify if new unknown field IDs detected
-    if ($unknownFieldIds.Count -gt 0) {
-        $body = "<p><strong>New unknown field IDs detected in PeopleSpheres API:</strong></p><ul>"
-        foreach ($k in $unknownFieldIds.Keys) {
-            $info = $unknownFieldIds[$k]
-            $body += "<li><b>ID:</b> $k | <b>Label:</b> $($info.label) | <b>Type:</b> $($info.type) | <b>User ID:</b> $($info.user)</li>"
-        }
-        $body += "</ul><p>Please review and update the field mappings if necessary.</p>"
-
-        IADAdmin_SendMailMessage -Body $body 
-                                 -To "jeremie.poujol@iadinternational.com" 
-                                 -Subject "[iadlife] New API Field IDs detected in PeopleSpheres" 
-                                 -BodyAsHtml
     }
 
     return $result
@@ -870,6 +855,7 @@ try {
 <#
 -- SQL Server Management Studio (SSMS) - Table structure for dbo.PEOPLESPHERE_Iad
 
+drop TABLE dbo.PEOPLESPHERE_Iad;
 CREATE TABLE dbo.PEOPLESPHERE_Iad (
     Datededebutdansleposte                VARCHAR(255),
     Youzerdatedembauche                   VARCHAR(255),
@@ -888,6 +874,9 @@ CREATE TABLE dbo.PEOPLESPHERE_Iad (
     Entitelegale                          VARCHAR(255),
     Site                                  VARCHAR(255),
     Matricule                             VARCHAR(255),
-    DateExeScript                         VARCHAR(255)
+    DateExeScript                         VARCHAR(255),
+    Actif                                 VARCHAR(255),  -- New field for Actif (Yes/No)
+    Prenom_caracteres_speciaux            VARCHAR(255)   -- New field for First Name with Special Characters
 )
+
 #>
