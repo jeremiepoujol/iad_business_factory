@@ -93,6 +93,22 @@ if ($IsTestMode) {
 }
 
 # -------------------------------------------------------
+# Global Email Configuration
+# -------------------------------------------------------
+if ($IsTestMode) {
+    $emailDetails = @{
+        To  = @("jeremie.poujol@iadinternational.com")
+        Cc  = @("pascal.raoult@iadinternational.com")
+        Bcc = @("986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms")
+    }
+} else {
+    $emailDetails = @{
+        To  = @("exploitation.notify@iadinternational.com")
+        Cc  = @("alexandre.kebaili-ext@iadinternational.com")
+        Bcc = @("986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms")
+    }
+}
+# -------------------------------------------------------
 # BLOCK 0 : Environment Preparation & Module Loading
 # -------------------------------------------------------
 
@@ -688,43 +704,42 @@ $asciiBanner = @"
 "@
 Write-Host $asciiBanner -ForegroundColor Green
 
+# Warn about too many token refreshes
 if ($TokenRefreshCount -gt 3) {
     Write-Host "⚠ Warning: Token was refreshed $TokenRefreshCount times – check performance." -ForegroundColor Red
 }
 
-# Append script signature
+# Append script signature to final body
 $finalBody += IADAdmin_AddScriptSignature
 
-# Compose subject
+# Compose email subject
 $emailSubject = "[iadlife] PeopleSpheres Export – $($scriptEndTime.ToString('yyyy-MM-dd'))"
 
-# Define recipients
-$IsTestMode = $true  # Set to $false in production
-
-$prodRecipients = @{
-    To  = @("exploitation.notify@iadinternational.com")
-    Cc  = @("alexandre.kebaili-ext@iadinternational.com")
-    Bcc = "986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms"
+# Set the recipients based on test mode
+$emailRecipients = if ($IsTestMode) { 
+    @{
+        To  = @("jeremie.poujol@iadinternational.com")
+        Cc  = @("jeremie.poujol@iadinternational.com")
+        Bcc = "986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms"
+    }
+} else { 
+    @{
+        To  = @("exploitation.notify@iadinternational.com")
+        Cc  = @("alexandre.kebaili-ext@iadinternational.com")
+        Bcc = "986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms"
+    }
 }
-
-$testRecipients = @{
-    To  = @("jeremie.poujol@iadinternational.com")
-    Cc  = @("jeremie.poujol@iadinternational.com")
-    Bcc = "986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms"
-}
-
-$emailRecipients = if ($IsTestMode) { $testRecipients } else { $prodRecipients }
 
 # Send email
 try {
     if ([string]::IsNullOrWhiteSpace($finalBody)) {
         Write-Warning "❗ Email not sent: email body is empty."
     } else {
-        IADAdmin_SendMailMessage -Body $finalBody 
-                                 -To $emailRecipients.To 
-                                 -Cc $emailRecipients.Cc 
-                                 -Bcc $emailRecipients.Bcc 
-                                 -Subject $emailSubject 
+        IADAdmin_SendMailMessage -Body $finalBody `
+                                 -To $emailRecipients.To `
+                                 -Cc $emailRecipients.Cc `
+                                 -Bcc $emailRecipients.Bcc `
+                                 -Subject $emailSubject `
                                  -BodyAsHtml
         Write-Host "📧 Email successfully sent to: $($emailRecipients.To -join ', ')" -ForegroundColor Green
     }
@@ -753,10 +768,13 @@ if ($script:HadErrors -and (Test-Path $script:LogPath)) {
 "@
 
         try {
-            IADAdmin_SendMailMessage -To "jeremie.poujol@iadinternational.com" 
-                                     -Subject $subject 
-                                     -Body $body 
-                                     -BodyAsHtml 
+            # Sending the error alert to the recipients
+            IADAdmin_SendMailMessage -To $emailDetails.To `
+                                     -Cc $emailDetails.Cc `
+                                     -Bcc $emailDetails.Bcc `
+                                     -Subject $subject `
+                                     -Body $body `
+                                     -BodyAsHtml `
                                      -Attachments $script:LogPath
             Write-Host "📧 Error alert mail sent with attached log file." -ForegroundColor Magenta
         } catch {
