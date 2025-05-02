@@ -404,7 +404,7 @@ $FieldMapRaw = @{
 }
 
 # Normalize keys from labels
-$FieldMap = @{}
+$FieldMap = @{ }
 foreach ($kvp in $FieldMapRaw.GetEnumerator()) {
     $FieldMap[$kvp.Key] = Normalize-Label $kvp.Value
 }
@@ -417,7 +417,7 @@ function Get-FlattenedUserData {
     )
 
     $result = @()
-    $unknownFieldIds = @{}
+    $unknownFieldIds = @{ }  # Initialize empty collection for unknown field IDs
     $counter = 1
     $total = $UserIds.Count
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -459,6 +459,7 @@ function Get-FlattenedUserData {
                         $userData[$key] = $value
                     }
 
+                    # For specific keys, store their data for display
                     switch ($key) {
                         "prenom"         { $prenom  = $userData[$key] }
                         "nom"            { $nom     = $userData[$key] }
@@ -468,6 +469,7 @@ function Get-FlattenedUserData {
                     }
                 }
                 else {
+                    # Collect any unmapped fields (for later reporting)
                     if (-not $unknownFieldIds.ContainsKey($idStr)) {
                         $unknownFieldIds[$idStr] = @{
                             label = $item.label
@@ -486,9 +488,6 @@ function Get-FlattenedUserData {
             }
 
             # 🔤 UTF-8 normalization for string fields
-            # Reason: Avoids encoding issues when exporting CSV (e.g., "M+üRCIA" instead of "MÚRCIA")
-            # Issue: Modifying values while iterating on a live dictionary (Keys) causes exceptions
-            # Fix: Use `.Keys.Clone()` to iterate over a safe static copy of keys
             foreach ($key in $userData.Keys.Clone()) {
                 if ($userData[$key] -is [string]) {
                     $userData[$key] = [System.Text.Encoding]::UTF8.GetString(
@@ -499,6 +498,7 @@ function Get-FlattenedUserData {
 
             $result += [PSCustomObject]$userData
 
+            # Display user block
             $displayBlock = @"
 ------------------------------
 👤 $prenom $nom
@@ -531,16 +531,16 @@ function Get-FlattenedUserData {
             $info = $unknownFieldIds[$k]
             $body += "<li><b>ID:</b> $k | <b>Label:</b> $($info.label) | <b>Type:</b> $($info.type) | <b>User ID:</b> $($info.user)</li>"
         }
-        $body += "</ul><p>Please review and update the script field mappings if needed.</p>"
+        $body += "</ul><p>Please review and update the field mappings if necessary.</p>"
 
-        IADAdmin_SendMailMessage -To "jeremie.poujol@iadinternational.com" `
-                                 -Subject "[iadlife] New API Field IDs detected in PeopleSpheres" `
-                                 -Body $body -BodyAsHtml
+        IADAdmin_SendMailMessage -Body $body 
+                                 -To "jeremie.poujol@iadinternational.com" 
+                                 -Subject "[iadlife] New API Field IDs detected in PeopleSpheres" 
+                                 -BodyAsHtml
     }
 
     return $result
 }
-
 
 # Process active and inactive users separately
 $ResultActive   = Get-FlattenedUserData -UserIds $UserIds_Active   -UserType "active"
@@ -673,80 +673,8 @@ try {
     $script:HadErrors = $true
 }
 
-# ----------------------------------------------
-# BLOCK 7 : ALERT FOR UNMAPPED PEOPLESPHERES FIELD IDS
-# ----------------------------------------------
-
 # -------------------------------------------------------
-# BLOCK 7 : ALERT FOR UNMAPPED PEOPLESPHERES FIELD IDS
-# -------------------------------------------------------
-
-# List to store unmapped field IDs with associated user info
-$unmappedFieldDetails = @()
-
-# ID to ignore (service account with elevated access – sees extra internal fields)
-$excludedUserIds = @(529)  # ← This account sees everything, ignore it on purpose
-
-# Re-scan all users (active + inactive) for unmapped field IDs
-foreach ($userId in ($UserIds_Active + $UserIds_Inactive)) {
-    if ($excludedUserIds -contains $userId) {
-        continue  # Skip known service/system accounts
-    }
-
-    try {
-        $url = "$BaseApiUrl/psos/$userId/fields?active=true&include=type,items,options,settings,assignment_settings"
-        $fields = (Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders)).data
-
-        foreach ($item in $fields) {
-            $fieldId = "$($item.id)"
-
-            if (-not $FieldMap.ContainsKey($fieldId)) {
-                $unmappedFieldDetails += [PSCustomObject]@{
-                    UserId   = $userId
-                    FieldId  = $fieldId
-                    Label    = if ($item.label) { $item.label } else { "(empty)" }
-                    Type     = if ($item.type.name) { $item.type.name } else { $item.type.alias }
-                }
-            }
-        }
-    } catch {
-        Write-Warning "⚠️ Failed to scan unmapped fields for user ID $userId"
-    }
-}
-
-# If unmapped fields found (excluding known service account), send a single alert email
-if ($unmappedFieldDetails.Count -gt 0) {
-    # Start HTML body
-    $alertBody = @"
-<p>🚨 <strong>Unmapped PeopleSpheres Field IDs Detected</strong></p>
-<p>The following field IDs were returned by the API but are not currently handled in the <code>FieldMap</code>.</p>
-<p>Note: Fields returned by service account(s) such as User ID 529 have been intentionally excluded.</p>
-
-<table border="1" cellpadding="5" cellspacing="0">
-<tr><th>User ID</th><th>Field ID</th><th>Label</th><th>Type</th></tr>
-"@
-
-    foreach ($entry in $unmappedFieldDetails) {
-        $alertBody += "<tr><td>$($entry.UserId)</td><td>$($entry.FieldId)</td><td>$($entry.Label)</td><td>$($entry.Type)</td></tr>n"
-    }
-
-    $alertBody += "</table>
-<p>Please review and update the field mappings if necessary.</p>"
-
-    try {
-        IADAdmin_SendMailMessage -Body $alertBody 
-                                 -To "jeremie.poujol@iadinternational.com" 
-                                 -Subject "[iadlife] 🔎 PeopleSpheres – Unmapped Field IDs Detected" 
-                                 -BodyAsHtml
-        Write-Host "📧 Global alert email sent for unmapped field IDs." -ForegroundColor Magenta
-    } catch {
-        Write-Host "❌ Failed to send unmapped fields alert email: $_" -ForegroundColor Red
-        $script:HadErrors = $true
-    }
-}
-
-# -------------------------------------------------------
-# BLOCK 8 : ERROR NOTIFICATION (if any error occurred)
+# BLOCK 7 : ERROR NOTIFICATION (if any error occurred)
 # -------------------------------------------------------
 
 if ($script:HadErrors -and (Test-Path $script:LogPath)) {
@@ -780,7 +708,7 @@ if ($script:HadErrors -and (Test-Path $script:LogPath)) {
 }
 
 # -------------------------------------------------------
-# BLOCK 9 : UPLOAD TO AZURE BLOB + BULK INSERT TO SQL
+# BLOCK 8 : UPLOAD TO AZURE BLOB + BULK INSERT TO SQL
 # -------------------------------------------------------
 
 # Azure and SQL configuration
