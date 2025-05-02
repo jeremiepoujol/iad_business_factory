@@ -541,6 +541,7 @@ function Get-FlattenedUserData {
     return $result
 }
 
+
 # Process active and inactive users separately
 $ResultActive   = Get-FlattenedUserData -UserIds $UserIds_Active   -UserType "active"
 $ResultInactive = Get-FlattenedUserData -UserIds $UserIds_Inactive -UserType "inactive"
