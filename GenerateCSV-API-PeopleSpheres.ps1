@@ -1,24 +1,107 @@
- <#
-.SYNOPSIS 
-    API CONNEXION SCRIPT 
+<#
+.SYNOPSIS
+    Extract, export and synchronize user data from PeopleSpheres API to Azure SQL.
+
 .DESCRIPTION
-	https://iadlife.peoplespheres.com/
+    This script performs a full data extraction from the PeopleSpheres API (both active and inactive users),
+    flattens the relevant fields based on a predefined mapping, and exports the data into CSV format.
+
+    It generates three output files:
+        - Two timestamped CSVs (active and inactive users) for automation/archive purposes
+        - One fixed-name CSV for Azure SQL ingestion (via Azure Blob + BULK INSERT)
+
+    The script also handles:
+        - Authentication with refreshable access tokens
+        - Detection and alerting on unknown field IDs (excluding technical accounts)
+        - Summary email reporting with export paths and key metrics
+        - Upload to Azure Blob Storage and synchronization into SQL Server
+        - Error logging and email alerting in case of failure
+
+    Block structure overview:
+        0. Environment Preparation & Module Loading
+        1. Global Setup & Utility Functions
+        2. Authentication & Token Management
+        3. User Data Loading (active/inactive)
+        4. Per-user Field Retrieval & Flattening
+        5. CSV Export
+        6. Summary Email Report
+        7. Alert for Unmapped Field IDs
+        8. Error Notification (with log)
+        9. Upload to Azure Blob & SQL Bulk Insert
+
+.PARAMETER IsTestMode
+    Boolean. When enabled, only fetches 25 users (active + inactive) instead of the full dataset.
+
+.OUTPUTS
+    - UTF-16 CSV files for active and inactive users: usable in Excel.
+    - UTF-8 CSV files with timestamp for automation ingestion.
+    - Email notification with record counts and export locations.
+
+.REQUIREMENTS
+    - PowerShell 5.1+
+    - Internet connectivity
+    - SecureString file for support-itps@iadinternational.com credentials
+    - IAD-Admin module available locally or globally
+
+.MODULES_REQUIRED
+    - ActiveDirectory
+    - IAD-Admin
+
 .NOTES
-	Authors : 
-		Jeremie Poujol (jeremie.poujol@iadinternational.com)
-	Version : 
-		V1.0 January 2022
+    Author  : Jérémie Poujol
+    Company : iad Business Factory
+    Version : 2.0
+    Created : 2022-01 (v1), Refactored : 2025-04-30 (v2)
+
 .LINK
-        https://fdocuments.net/document/api-documentation-guide.html?page=1
-        Old documentation: https://rest.monportailrh.com/swagger/ 
-        New documentation: https://rest.monportailrh.com/docs/ 
+    API Docs (legacy): https://rest.monportailrh.com/swagger/
+    API Docs (modern): https://rest.monportailrh.com/docs/
+    SSO Auth:          https://sso.monportailrh.com/auth/
 
 .EXAMPLE
-    [ps] E:\Powershell\Scheduled_task\API_PeopleSphere.ps1
+    PS> .\GenerateCSV-API-PeopleSpheres.ps1
 #>
 
-Clear-Host
+# =====================================================================
+# 🧪 TEST MODE SWITCH – SET THIS VALUE BEFORE RUNNING THE SCRIPT
+# =====================================================================
+# This section controls whether the script runs in test or production mode.
+#
+#   - TEST MODE     → limits API calls to $MaxTestUsers users per status (active/inactive)
+#   - PRODUCTION    → processes all available users from the API
+#
+# ✅ Change this setting before launching the script.
+#    Do not edit it elsewhere in the script.
 
+$IsTestMode   = $true         # ← ❗ Set to $false in production
+$MaxTestUsers = 50            # Applies only in test mode
+
+# Display warning if test mode is active
+if ($IsTestMode) {
+    $banner = @"
+╔════════════════════════════════════════════════════════════════════╗
+║                       ⚠ TEST MODE ACTIVE ⚠                        ║
+╠════════════════════════════════════════════════════════════════════╣
+║ Only the first $MaxTestUsers ACTIVE + $MaxTestUsers INACTIVE users       ║
+║ will be retrieved from the PeopleSpheres API.                    ║
+║                                                                  ║
+║ ➤ This helps speed up testing and avoid unnecessary load         ║
+║ ➤ To disable: set $IsTestMode = $false before running the script ║
+╚════════════════════════════════════════════════════════════════════╝
+"@
+    Write-Host $banner -ForegroundColor Yellow
+}
+
+# -------------------------------------------------------
+# BLOCK 0 : Environment Preparation & Module Loading
+# -------------------------------------------------------
+
+# Clear screen and enforce TLS 1.2 for all web requests
+Clear-Host
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Write-Host "🔐 TLS 1.2 enabled for secure web communication." -ForegroundColor Cyan
+
+# Display ASCII banner
 $logo = @"
 .__            .___ ___.                .__                                _____               __                       
 |__|____     __| _/ \_ |__  __ __  _____|__| ____   ____   ______ ______ _/ ____\____    _____/  |_  ___________ ___.__.
@@ -26,491 +109,781 @@ $logo = @"
 |  |/ __ \_/ /_/ |   | \_\ \  |  /\___ \|  |   |  \  ___/ \___ \ \___ \   |  |   / __ \\  \___|  | (  <_> )  | \/\___  |
 |__(____  /\____ |   |___  /____//____  >__|___|  /\___  >____  >____  >  |__|  (____  /\___  >__|  \____/|__|   / ____|
         \/      \/       \/           \/        \/     \/     \/     \/              \/     \/                   \/     
-
 "@
-Write-Host $logo -ForegroundColor "green"
-Write-Host "Bienvenue dans iadlife.peoplespheres.com" -ForegroundColor "white"
+Write-Host $logo -ForegroundColor Green
+Write-Host "🔄 Starting PeopleSpheres API data extraction..." -ForegroundColor White
 Start-Sleep -Seconds 1
 
-# Check password support-itps@iadinternational.com exist 
-While (!(Test-Path C:\Scripts\SecureString\support-itps@iadinternational.com.$env:username.securestring))
-{
-    Write-Host "No SecureString has been found for user" $env:username "in C:\Scripts\SecureString folder" -ForegroundColor Yellow
-    read-host "Enter support-itps@iadinternational.com's Password" -AsSecureString | ConvertFrom-SecureString | Out-File -FilePath C:\Scripts\SecureString\support-itps@iadinternational.com.$env:username.securestring
-}
+# Timestamp
+$script:Timestamp = Get-Date -Format "yyyyMMdd"
 
-# Authentication - To get a Bearer token, you should use the API request below:
-$url = "https://sso.monportailrh.com/auth/realms/Internal-idp/protocol/openid-connect/token"
+# === Export folders (simplified) ===
+$script:CsvExportFolder = "E:\Powershell\03-FlatFilesStorage\GenerateCSV-API-PeopleSpheres"
+$script:CsvAzureFolder  = "E:\Powershell\03-FlatFilesStorage\AzureSQLDatabase_csv"
+$script:LogFolder       = "E:\Powershell\04-ScriptLogsAndOutputs\GenerateCSV-API-PeopleSpheres"
 
-# Token expires within 5 minutes, during this time you can: 
-#  1. Login again 
-#  2. Or, Refresh the token by sending following request:
-<#
-• POST https://sso.monportailrh.com/auth/realms/Internal-idp/protocol/openid-connect/token 
-• Header: "Content-Type" = application/x-www-form-urlencoded 
-• Body: 
-o grant_type: refresh_token 
-o client_id: realm-management 
-o refresh_token: {the expired token} 
-#>
+# === Final paths ===
+$script:CsvActive_Timestamped   = Join-Path $script:CsvExportFolder "PeopleSpheres-active-$($script:Timestamp).csv"
+$script:CsvInactive_Timestamped = Join-Path $script:CsvExportFolder "PeopleSpheres-inactive-$($script:Timestamp).csv"
+$script:CsvAzure_NoTimestamp    = Join-Path $script:CsvAzureFolder  "GenerateCSV-API-PeopleSpheres.csv"
+$script:LogPath                 = Join-Path $script:LogFolder       "PeopleSpheres-Export.log"
 
-$startTime = Get-Date
-
-<#  In a PowerShell script that is currently running, you can use the StartTime property of the Get-Process object to get the time when the script was started, and then use the Elapsed property of the Stopwatch object to get the elapsed time since the script began running. You can then use an if statement to check if this time is greater than 4 minutes and, if so, execute a specific action. Here is an example code that can help you:
-$stopwatch = [diagnostics.stopwatch]::StartNew()
-# your code here
-# check if script has been running for more than 4 minutes
-if ($stopwatch.Elapsed -gt [timespan]::FromMinutes(4)) {
-    # execute your specific action here
-}
-#>
-
-$secureString = Get-Content "C:\Scripts\SecureString\support-itps@iadinternational.com.$env:username.securestring" | ConvertTo-SecureString
-$clearText = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureString))
-
-<#
-$password = Read-Host "Please enter password" -AsSecureString
-$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
-$SecurePassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-#> 
-  
-$body = [ordered]@{
-    "grant_type" = "password";
-    "client_id" = "monportailrh-web-app";
-    "username" = "support-itps@iadinternational.com";
-    "password" = $clearText
-}  
-$header = [ordered]@{
-    "authority" = "rest.monportailrh.com";
-    "sec-ch-ua" = "Not A;Brand`";v=`"99`", `"Chromium`";v=`"96`", `"Google Chrome`";v=`"96`"";
-    "accept" = "application/json, text/plain, */*";
-    "accept-language" = "fr";
-    "sec-ch-ua-mobile" = "?0";
-    "user-agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36";
-    "sec-ch-ua-platform" = "Windows";
-    "origin" = "https://app.monportailrh.com";
-    "sec-fetch-site" = "same-site";
-    "sec-fetch-mode" = "cors";
-    "sec-fetch-dest" = "empty";
-    "referer" = "https://app.monportailrh.com/"
-}
-
-$response = Invoke-RestMethod -Uri $url -Method 'Post' -Body $body -Headers $header
-$bearer_access_token = $response.access_token
-$token=1
-<#
-Get Users
-Get users per pagination, the request below is to get the first 25 active users
-GET     https://rest.monportailrh.com/search?name=&pso-type=usr&page=1&active=1&per-page=25 
-
-• pso-type=usr 
-• page=1 
-• active=1 
-• per-page=25
-#>
-
-$url2 = "https://rest.monportailrh.com/search?include=data.quick_actions&name=&page=1&per-page=25&pso-type=usr"
-$header2 = [ordered]@{
-    "accept" = "application/json, text/plain, */*";
-    "authorization" = "Bearer $bearer_access_token"
-}
-$result2 = Invoke-RestMethod -Uri $url2 -Headers $header2
-# sample : $result2.data.data[0].fields
-$totalusers = $result2.data.meta.pagination.total
-
-write-host $totalusers "Utilisateurs a traiter dans PeopleSphere" -ForegroundColor Red -BackgroundColor Yellow
-
-$url3 = "https://rest.monportailrh.com/search?name=&pso-type=usr&page=1&active=1&per-page=$totalusers"
-$result3 = Invoke-RestMethod -Uri $url3 -Headers $header2
-
-##############################################################################
-#$result3.data.data | Where-Object {$_.id -eq 10}
-#$result3.data.data | Where-Object {$_.fields.value -eq "poujol"}
-#$result3.data.data | Where-Object { $_.fields | Where-Object { $_.id -eq 125 -and $_.value -eq "POUJOL" } }
-##############################################################################
-
-<#
-$id = 484
-$url4 = "https://rest.monportailrh.com/psos/$id/fields?active=true&include=type,items,options,settings,assignment_settings"
-$result4 = Invoke-RestMethod -Uri $url4 -Headers $header2
-foreach ($item in $result4.data) {
-    Write-Output "ID: $($item.id) - Name: $($item.name) - Alias: $($item.alias)"
-}
-Write-Output $result4.data[0]
-#>
-
-$result=@()
-foreach ($id in $result3.data.data.id) {
-    $url4 = "https://rest.monportailrh.com/psos/$id/fields?active=true&include=type,items,options,settings,assignment_settings"
-    $result4 = Invoke-RestMethod -Uri $url4 -Headers $header2
-    Write-host -ForegroundColor yellow "--"
-    Write-Host -ForegroundColor yellow "Traitement user id #$id - " $result4.data[9].value_details #mail pro si la position dans le tableau de bouge pas /!\
-    Write-host -ForegroundColor yellow "--"
-    $ids = 711, 2637, 683, 2638, 1145, 125, 123, 423, 550, 28, 27, 182, 344, 185, 186, 348, 859
-    <# $result4.data | Select-Object id, name
-        id name
-        -- ----
-        711 Date de début dans le poste
-        2637 [YOUZER] Date d'embauche
-        683 Départ de la société
-        2638 - [YOUZER] Date de sortie
-        1145 Type collaboration
-        125 Nom
-        123 Prénom
-        423 Image de profil
-        550 Civilité
-        28 Adresse e-mail professionnelle
-        27 Téléphone portable professionnel
-        182 Responsable
-        344 Service
-        185 Poste
-        186 Entité Légale
-        348 Site
-        859 Matricule
-    #>
-    <#  support-itps@iadinternational.com ()
-        New ID found not expected : 665 - Numéro de téléphone personnel
-        New ID found not expected : 666 - Adresse e-mail personnelle
-        New ID found not expected : 648 - Adresse personnelle
-        New ID found not expected : 511 - Contact en cas d'urgence
-        New ID found not expected : 525 - Personne à charge
-        New ID found not expected : 516 - Situation familiale
-        New ID found not expected : 667 - Expérience professionnelle
-        New ID found not expected : 746 - Formation
-        New ID found not expected : 735 - Certifications
-        New ID found not expected : 1073 - LinkedIn
-        New ID found not expected : 680 - Langue
-        New ID found not expected : 1077 - Attestation employeur
-        New ID found not expected : 1103 - Attestation Mutuelle Obligatoire
-        New ID found not expected : 1108 - Attestation non perception supplément familial
-        New ID found not expected : 1125 - Demande d'attestation
-        New ID found not expected : 127 - Nom d'utilisateur
-        New ID found not expected : 626 - Mutuelle
-        New ID found not expected : 612 - Compte bancaire
-    #>
-    foreach ($item in $result4.data) {
-        if ($ids -contains $item.id) {
-            Write-Host -foregroundColor blue "$($item.id) - $($item.name) : " -NoNewline
-            if ($item.id -eq 711) {
-                $datededebutdansleposte = $item.value_details
-                Write-Host $datededebutdansleposte
-            }
-            elseif ($item.id -eq 2637) {
-                $youzerdatedembauche = $item.value_details
-                Write-Host $youzerdatedembauche
-            }
-            elseif ($item.id -eq 683) {
-                $departdelasociete = $item.value_details
-                Write-Host $departdelasociete
-            }
-            elseif ($item.id -eq 2638) {
-                $youzerdatedesortie = $item.value_details
-                Write-Host $youzerdatedesortie
-            }
-            elseif ($item.id -eq 1145) {
-                $typecollaboration = $item.value_details
-                Write-Host $typecollaboration
-            }
-            elseif ($item.id -eq 125) {
-                $nom = $item.value_details
-                Write-Host $nom
-            }
-            elseif ($item.id -eq 123) {
-                $prenom = $item.value_details
-                Write-Host $prenom
-            }
-            elseif ($item.id -eq 423) {
-                $imagedeprofil = $item.value_details
-                Write-Host $imagedeprofil
-            }
-            elseif ($item.id -eq 550) {
-                $civilite = $item.value_details
-                Write-Host $civilite
-            }
-            elseif ($item.id -eq 28) {
-                $adresseemailprofessionnelle = $item.value_details
-                Write-Host $adresseemailprofessionnelle 
-            }
-            elseif ($item.id -eq 27) {
-                $telephoneportableprofessionnel = $item.value_details
-                Write-Host $telephoneportableprofessionnel
-            }
-            elseif ($item.id -eq 182) {
-                $Responsable = $item.value_details.professional_email
-                Write-Host $Responsable
-            }
-            elseif ($item.id -eq 344) {
-                $Service = $item.value_details
-                Write-Host $Service
-            }
-            elseif ($item.id -eq 185) {
-                $Poste = $item.value_details
-                Write-Host $Poste
-            }
-            elseif ($item.id -eq 186) {
-                $entitelegale = $item.value_details
-                Write-Host $entitelegale
-            }
-            elseif ($item.id -eq 348) {
-                $site = $item.value_details
-                Write-Host $site
-            }
-            elseif ($item.id -eq 859) {
-                $matricule = $item.value_details
-                Write-Host $matricule
-            }
-        } else {
-            <# Action when all if and elseif conditions are false #>
-            Write-Host -foregroundColor Red "New ID found not expected : $($item.id) - $($item.name)"
-        }        
+# === Create folders if missing ===
+$folders = @($script:CsvExportFolder, $script:CsvAzureFolder, $script:LogFolder)
+foreach ($folder in $folders) {
+    if (-not (Test-Path $folder)) {
+        New-Item -Path $folder -ItemType Directory -Force | Out-Null
     }
-    $hash=[ordered]@{
-        "Date de début dans le poste"=$datededebutdansleposte;
-        "[YOUZER] Date d'embauche"=$youzerdatedembauche;
-        "Départ de la société"=$departdelasociete;    
-        "[YOUZER] Date de sortie"=$youzerdatedesortie
-        "Type collaboration"=$typecollaboration;
-        "Nom"=$nom;
-        "Prénom"=$prenom;
-        "Image de profil"=$imagedeprofil;
-        "Civilité"=$civilite;
-        "Adresse e-mail professionnelle"=$adresseemailprofessionnelle;
-        "Téléphone portable professionnel"=$telephoneportableprofessionnel;
-        "Responsable"=$Responsable;
-        "Service"=$Service;
-        "Poste"=$Poste;
-        "Entité Légale"=$entitelegale;
-        "Site"=$site;
-        "Matricule"=$matricule;
-        "DateExeScript"=Get-Date;
-    }
-    $obj=New-Object psobject -property $hash
-    $result+=$obj
-    $elapsedTime = (Get-Date) - $startTime
-    if ($elapsedTime.TotalMinutes -ge 4 -and $token -eq 1) {
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        write-host $totalusers "The token 1 is about to expire  - refresh_token for a second one - "$elapsedTime.TotalMinutes" minutes" -ForegroundColor Red -BackgroundColor Yellow
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        # Script has been running for 4 minutes or more, avoid expiration and refresh the token by sending following request
-        $response = Invoke-RestMethod -Uri $url -Method 'Post' -Body $body -Headers $header
-        $bearer_access_token = $response.access_token
-        $header2 = [ordered]@{
-            "accept" = "application/json, text/plain, */*";
-            "authorization" = "Bearer $bearer_access_token"
-        }
-        $token=2           
-    } elseif ($elapsedTime.TotalMinutes -ge 8 -and $token -eq 2) {
-        # Code à exécuter si le temps écoulé est supérieur ou égal à 8 minutes et que $token est égal à 2
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        write-host $totalusers "The token 2 is about to expire  - refresh_token for a third one - "$elapsedTime.TotalMinutes" minutes" -ForegroundColor Red -BackgroundColor Yellow
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        # Script has been running for 8 minutes or more, avoid expiration and refresh the token by sending following request
-        $response = Invoke-RestMethod -Uri $url -Method 'Post' -Body $body -Headers $header
-        $bearer_access_token = $response.access_token
-        $header2 = [ordered]@{
-            "accept" = "application/json, text/plain, */*";
-            "authorization" = "Bearer $bearer_access_token"
-        }
-        $token=3 # avoid to enter in the loop
-    } elseif ($elapsedTime.TotalMinutes -ge 12 -and $token -eq 3) {
-        # Code à exécuter si le temps écoulé est supérieur ou égal à 8 minutes et que $token est égal à 2
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        write-host $totalusers "The token 3 is about to expire  - refresh_token for a fourth one - "$elapsedTime.TotalMinutes" minutes" -ForegroundColor Red -BackgroundColor Yellow
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        # Script has been running for 12 minutes or more, avoid expiration and refresh the token by sending following request
-        $response = Invoke-RestMethod -Uri $url -Method 'Post' -Body $body -Headers $header
-        $bearer_access_token = $response.access_token
-        $header2 = [ordered]@{
-            "accept" = "application/json, text/plain, */*";
-            "authorization" = "Bearer $bearer_access_token"
-        }
-        $token=4 # avoid to enter in the loop
-    } elseif ($elapsedTime.TotalMinutes -ge 16 -and $token -eq 4) {
-        # Code à exécuter si le temps écoulé est supérieur ou égal à 8 minutes et que $token est égal à 2
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        write-host $totalusers "The token 3 is about to expire  - refresh_token for a fourth one - "$elapsedTime.TotalMinutes" minutes" -ForegroundColor Red -BackgroundColor Yellow
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        # Script has been running for 12 minutes or more, avoid expiration and refresh the token by sending following request
-        $response = Invoke-RestMethod -Uri $url -Method 'Post' -Body $body -Headers $header
-        $bearer_access_token = $response.access_token
-        $header2 = [ordered]@{
-            "accept" = "application/json, text/plain, */*";
-            "authorization" = "Bearer $bearer_access_token"
-        }
-        $token=5 # avoid to enter in the loop
-    } elseif ($elapsedTime.TotalMinutes -ge 20 -and $token -eq 5) {
-        # Code à exécuter si le temps écoulé est supérieur ou égal à 8 minutes et que $token est égal à 2
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        write-host $totalusers "The token 3 is about to expire  - refresh_token for a fourth one - "$elapsedTime.TotalMinutes" minutes" -ForegroundColor Red -BackgroundColor Yellow
-        write-host -ForegroundColor Red -BackgroundColor Yellow "--"
-        # Script has been running for 12 minutes or more, avoid expiration and refresh the token by sending following request
-        $response = Invoke-RestMethod -Uri $url -Method 'Post' -Body $body -Headers $header
-        $bearer_access_token = $response.access_token
-        $header2 = [ordered]@{
-            "accept" = "application/json, text/plain, */*";
-            "authorization" = "Bearer $bearer_access_token"
-        }
-        $token=6 # avoid to enter in the loop
+}
+
+# === Import required modules ===
+Write-Host "📦 Importing required modules..." -ForegroundColor White
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Write-Host "✅ Module 'ActiveDirectory' loaded." -ForegroundColor Green
+} catch {
+    Write-Host "❌ Failed to import 'ActiveDirectory' module." -ForegroundColor Red
+    Exit 1
+}
+
+# Load IAD-Admin from default location or fallback path
+if (-not (Get-Module -Name IAD-Admin -ListAvailable)) {
+    $fallbackPath = "E:\Powershell\00_Modules\IAD-Admin"
+    if (Test-Path $fallbackPath) {
+        Import-Module $fallbackPath -ErrorAction Stop
+        Write-Host "✅ Module 'IAD-Admin' loaded from fallback path." -ForegroundColor Green
     } else {
-        # normal operation, script continuity
+        Write-Host "❌ 'IAD-Admin' module not found in default or fallback path." -ForegroundColor Red
+        Exit 1
+    }
+} else {
+    Import-Module IAD-Admin -ErrorAction Stop
+    Write-Host "✅ Module 'IAD-Admin' loaded." -ForegroundColor Green
+}
+
+Write-Host "=====================================n" -ForegroundColor White
+
+# -------------------------------------------------------
+# BLOCK 1 : Global Setup & Utility Functions
+# -------------------------------------------------------
+
+$scriptStartTime = Get-Date
+$global:TokenRefreshCount = 0
+$script:HadErrors = $false
+
+
+function Show-TokenRefreshedBanner {
+    param (
+        [datetime]$startTime,
+        [int]$refreshCount
+    )
+
+    $elapsed      = (Get-Date) - $startTime
+    $elapsedStr   = $elapsed.ToString("hh\:mm\:ss")
+
+    # Compose each line
+    $title        = "TOKEN REFRESHED"
+    $line1        = "⏱  Elapsed Time       : $elapsedStr"
+    $line2        = "🔄  Total Refresh Count: $refreshCount"
+
+    # Determine max line width
+    $allLines     = @($title, $line1, $line2)
+    $maxLength    = ($allLines | Measure-Object -Property Length -Maximum).Maximum
+    $padding      = 4 # 2 spaces on each side of content inside borders
+    $totalWidth   = $maxLength + $padding + 2 # +2 for the '#' at both ends
+
+    # Top/Bottom border
+    $borderLine   = "#" * $totalWidth
+
+    # Helper to wrap lines
+    function Wrap-Line($text) {
+        $spaces = " " * ($maxLength - $text.Length)
+        return "# $text$spaces #"
+    }
+
+    # Build full banner
+    $banner = @(
+        $borderLine
+        Wrap-Line $title
+        Wrap-Line ("-" * $maxLength)
+        Wrap-Line $line1
+        Wrap-Line $line2
+        $borderLine
+    ) -join "n"
+
+    Write-Host $banner -ForegroundColor Cyan
+}
+
+
+function Normalize-Label {
+    param ([string]$label)
+    return ($label.Normalize('FormD') -replace '\p{Mn}', '' -replace '[^\w\s]', '' -replace '\s+', '_' -replace '_+', '_' | ForEach-Object { $_.ToLowerInvariant() })
+}
+
+function Refresh-AccessToken {
+    Write-Host "🔁 Refreshing access token..." -ForegroundColor Yellow
+    $refreshBody = @{
+        "grant_type"    = "refresh_token"
+        "client_id"     = $clientId
+        "refresh_token" = $refreshToken
+    }
+    try {
+        $refreshResponse = Invoke-RestMethod -Uri $authUrl -Method POST -Body $refreshBody -Headers $authHeaders
+        $global:accessToken  = $refreshResponse.access_token
+        $global:refreshToken = $refreshResponse.refresh_token
+        $global:tokenTime    = Get-Date
+        Write-Host "✅ Access token refreshed at $tokenTime" -ForegroundColor Green
+    } catch {
+        Write-Host "❌ Failed to refresh access token." -ForegroundColor Red
+        Exit 1
     }
 }
 
-# Define the base path without extension (for the UTF-16 "production" export)
-$basePath = "E:\Powershell\03-FlatFilesStorage\AzureSQLDatabase_csv\GenerateCSV-API-PeopleSpheres"
+# Add more reusable functions here if needed
 
-# Export to UTF-16 (Unicode) for Excel compatibility (production output)
-$exportUnicode = "$basePath-excel.csv"
-$result | Export-Csv -NoTypeInformation -Path $exportUnicode -Encoding Unicode
+# -------------------------------------------------------
+# BLOCK 2 : AUTHENTICATION & TOKEN MANAGEMENT
+# -------------------------------------------------------
 
-# Define target folder for the UTF-8 export
-$utf8Folder = "E:\Powershell\03-FlatFilesStorage\GenerateCSV-API-PeopleSpheres\"
-# Create the folder if it doesn't exist
-if (-not (Test-Path $utf8Folder)) {
-    New-Item -ItemType Directory -Path $utf8Folder | Out-Null
+# Global token values
+$script:AccessToken  = $null
+$script:RefreshToken = $null
+$script:TokenTime    = $null
+
+# Auth configuration
+$script:ClientId     = "monportailrh-web-app"
+$script:Username     = "support-itps@iadinternational.com"
+$script:AuthUrl      = "https://sso.monportailrh.com/auth/realms/Internal-idp/protocol/openid-connect/token"
+$script:SecurePath   = "C:\Scripts\SecureString\$Username.$env:USERNAME.securestring"
+
+# Prompt for password if secure file doesn't exist
+if (-not (Test-Path $SecurePath)) {
+    Write-Host "🔐 No secure string found. Prompting for password..." -ForegroundColor Yellow
+    Read-Host "Enter password for $Username" -AsSecureString |
+        ConvertFrom-SecureString |
+        Out-File -FilePath $SecurePath
 }
 
-# Generate a timestamp for the UTF-8 filename
-$timestamp = Get-Date -Format "yyyyMMdd"
-$exportUtf8 = "$utf8Folder\GenerateCSV-API-PeopleSpheres-utf8-$timestamp.csv"
-
-# Export to UTF-8 with timestamp (for automation/scripts)
-$result | Export-Csv -NoTypeInformation -Path $exportUtf8 -Encoding UTF8
-
-# Output confirmation
-Write-Host "✅ CSV exports completed:"
-Write-Host " - UTF-16 (Excel / production): $exportUnicode"
-Write-Host " - UTF-8  (Script / timestamped): $exportUtf8"
-
-########################
-# UPLOAD FILE TO AZURE #
-########################
-$tenant = "e419a47d-b189-44f1-a28e-16be83c1f11e"
-$subscription = "f9d75155-d6d0-4867-b0c0-cec83ecea40c"
-$Usertenant = "AzSce_PSScript@iadgroup.onmicrosoft.com"
-
-$ResourceGroupName = "rg-frc-coreservices"
-$StorageAccountName = "iadsamgmtfrccore"  #iadstorageaccount122022
-
-$ServerInstance = "sql-frc-coreservices-iad.database.windows.net"
-$Database = "iaddb"
-$Database_SA_LOGIN = "PSScript"
-
-While (!(Test-Path C:\scripts\SecureString\$Usertenant.$env:username.securestring))
-{
-    read-host "Enter $Usertenant's Password" -AsSecureString | ConvertFrom-SecureString | Out-File -FilePath C:\scripts\SecureString\$Usertenant.$env:username.securestring
-}
-$secure_passwd=Get-Content "C:\Scripts\SecureString\$Usertenant.$env:username.securestring" | ConvertTo-SecureString
-$Credential = New-Object System.Management.Automation.PSCredential ($Usertenant , $secure_passwd)
-
-#Connexion Azure dans le bon contexte
-Connect-AzAccount -Credential $Credential -Tenant $tenant -Subscription $subscription
-
-#contexte storage account
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName
-$context= $storageAccount.Context
-$containerName = "csvcontainer"
-
-#local file path et blob  
-$localFilePath=$exportPath
-$blobName="GenerateCSV-API-PeopleSpheres.csv" 
-
-#upload blob
-Set-AzStorageBlobContent -Container $containerName -Blob $blobName -File $localFilePath -Context $context -Force
-
-While (!(Test-Path C:\Scripts\SecureString\$ServerInstance.$env:username.securestring))
-{
-    Write-Host "No SecureString has been found for user" $env:username "in C:\Scripts\SecureString folder" -ForegroundColor Yellow
-    read-host "Enter SA Password for $ServerInstance" -AsSecureString | ConvertFrom-SecureString | Out-File -FilePath C:\Scripts\SecureString\$ServerInstance.$env:username.securestring
-}
-
-$secString=Get-Content "C:\Scripts\SecureString\$ServerInstance.$env:username.securestring" | ConvertTo-SecureString
-$credential = New-Object System.Management.Automation.PSCredential ($Database_SA_LOGIN,$secString)
-
-$passwd=$credential.GetNetworkCredential().password
-
-$query=@"
-TRUNCATE TABLE dbo.PEOPLESPHERE_Iad
-BULK INSERT dbo.PEOPLESPHERE_Iad
-FROM 'csvcontainer/GenerateCSV-API-PeopleSpheres.csv'
-WITH (DATA_SOURCE = 'blobcontainer', FIRSTROW = 2, FORMAT = 'CSV');
-"@
-
-$params = @{
-   'Database' = $Database
-   'ServerInstance' =  $ServerInstance
-   'Username' = $Database_SA_LOGIN
-   'Password' = $passwd
-   'OutputSqlErrors' = $true
-   'Query' = $query
-   }
-
-Invoke-Sqlcmd  @params -EncryptConnection
-
-<#
-# Enable  TLS 1.2 and Define password pour no-reply-ps
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$smtppw = Get-Content "C:\Scripts\SecureString\No-Reply-PS@iadinternational.com.$env:username.securestring" | ConvertTo-SecureString
-$credentials = New-Object System.Management.Automation.PSCredential ("No-Reply-PS@iadinternational.com", $smtppw)
-#$credentials = New-Object System.Management.Automation.PSCredential("no-reply-ps@iadinternational.com", (ConvertTo-SecureString "password" -AsPlainText -Force))
-While (!(Test-Path C:\scripts\SecureString\No-Reply-PS@iadinternational.com.$env:username.securestring)){
-    Write-Host "No SecureString has been found for user" $env:username "in C:\scripts\SecureString\" -ForegroundColor Yellow
-    read-host "Enter No-Reply-PS@iadinternational.com's Password" -AsSecureString | ConvertFrom-SecureString | Out-File -FilePath C:\scripts\SecureString\No-Reply-PS@iadinternational.com.$env:username.securestring
-}
-
-# Function signature mail
-function Get-ScriptName
-{ 
-	return $MyInvocation.ScriptName; 
-}
-
-
-$body = "Nouveau csv generated" 
-$ScriptName = $ScriptName | Get-ScriptName
-$body+="<br><br>RunAs cov\$env:username On $env:computername <i>(local path : $ScriptName)</i><br>"
-#$body+="Log file on bf-lie-mgt01 : $($LogFilePath)<br>"
-$body+=Get-content -Path E:\Powershell\02_Common\email_signature\SignatureSI.txt
-
-
-$emailParams = @{
-    To = "jeremie.poujol@iadinternational.com"
-    Cc = "jeremie.poujol@iadinternational.com"
-    #No-Reply-PS - Network and System IT <986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms>
-    Bcc = "jeremie.poujol@iadinternational.com"
-    From = "no-reply-ps@iadinternational.com"
-    Subject = "API CONNEXION SCRIPT  - iadlife - peoplesphere"
-    Body = $body
-    BodyAsHtml = $true
-    Encoding = [System.Text.Encoding]::UTF8
-    SmtpServer = "smtp.office365.com"
-    Credential = $credentials
-    Port = 587
-    UseSsl = $true   
-}
-Send-MailMessage @emailParams
-#>
-
-<# SQL Server Management Studio (SSMS) Creation query
-
-CREATE TABLE dbo.PEOPLESPHERE_Iad (
-	Datededebutdansleposte VARCHAR(255),
-    Youzerdatedembauche VARCHAR(255),
-	Departdelasociete VARCHAR(255),
-    Youzerdatedesortie VARCHAR(255),
-    Typecollaboration VARCHAR(255),
-	Nom VARCHAR(255),
-	Prenom VARCHAR(255),
-	Imagedeprofil VARCHAR(255),
-	Civilite VARCHAR(255),
-	Adresseemailprofessionnelle VARCHAR(255),
-	Telephoneportableprofessionnel VARCHAR(255),
-	Responsable VARCHAR(255),
-    Service VARCHAR(255),
-    Poste VARCHAR(255),
-    Entitelegale VARCHAR(255),
-    Site VARCHAR(255),
-    Matricule VARCHAR(255),
-	DateExeScript VARCHAR(255)
+# Load and decrypt password
+$SecureString = Get-Content $SecurePath | ConvertTo-SecureString
+$PlainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
 )
 
+# Define common headers and body
+$script:AuthHeaders = @{
+    "Content-Type" = "application/x-www-form-urlencoded"
+    "Accept"       = "application/json"
+}
+
+# Function to request a fresh access token
+function Request-AccessToken {
+    $body = @{
+        "grant_type" = "password"
+        "client_id"  = $ClientId
+        "username"   = $Username
+        "password"   = $PlainPassword
+    }
+
+    try {
+        $response = Invoke-RestMethod -Uri $AuthUrl -Method POST -Body $body -Headers $AuthHeaders
+        $script:AccessToken  = $response.access_token
+        $script:RefreshToken = $response.refresh_token
+        $script:TokenTime    = Get-Date
+        Write-Host "✅ Access token acquired at $TokenTime" -ForegroundColor Cyan
+    } catch {
+        Write-Host "❌ Failed to retrieve access token." -ForegroundColor Red
+        Exit 1
+    }
+}
+
+# Function to refresh token when needed (after 4 min+)
+function Refresh-AccessToken {
+    $refreshBody = @{
+        "grant_type"    = "refresh_token"
+        "client_id"     = $ClientId
+        "refresh_token" = $RefreshToken
+    }
+
+    try {
+        $response = Invoke-RestMethod -Uri $AuthUrl -Method POST -Body $refreshBody -Headers $AuthHeaders
+        $script:AccessToken  = $response.access_token
+        $script:RefreshToken = $response.refresh_token
+        $script:TokenTime    = Get-Date
+        Write-Host "🔁 Token refreshed at $TokenTime" -ForegroundColor Yellow
+    } catch {
+        Write-Host "❌ Failed to refresh access token." -ForegroundColor Red
+        Exit 1
+    }
+}
+
+# Trigger initial token request
+Request-AccessToken
+
+# -------------------------------------------------------
+# BLOCK 3 : USER DATA LOADING (ACTIVE & INACTIVE)
+# -------------------------------------------------------
+
+# Base PeopleSpheres API URL
+$BaseApiUrl = "https://rest.monportailrh.com"
+
+# Build dynamic authorization headers
+function Get-ApiHeaders {
+    return @{
+        "Authorization" = "Bearer $AccessToken"
+        "Accept"        = "application/json"
+    }
+}
+
+# Function to fetch user IDs based on active status
+function Get-UserIds {
+    param (
+        [bool]$Active
+    )
+
+    $headers = Get-ApiHeaders
+    $status  = if ($Active) { 1 } else { 0 }
+    $label   = if ($Active) { "ACTIVE" } else { "INACTIVE" }
+
+    if ($IsTestMode) {
+        Write-Host "🧪 TEST MODE: Fetching first $MaxTestUsers $label users from PeopleSpheres..." -ForegroundColor Yellow
+        $url = "$BaseApiUrl/search?include=data.quick_actions&name=&page=1&per-page=$MaxTestUsers&pso-type=usr&active=$status"
+    } else {
+        Write-Host "📦 Fetching $label user count..." -ForegroundColor Gray
+        $metaUrl = "$BaseApiUrl/search?name=&pso-type=usr&page=1&per-page=1&active=$status"
+        $metaResponse = Invoke-RestMethod -Uri $metaUrl -Headers $headers
+        $totalUsers = $metaResponse.data.meta.pagination.total
+        Write-Host "🔢 $label user count: $totalUsers" -ForegroundColor Cyan
+
+        $url = "$BaseApiUrl/search?include=data.quick_actions&name=&page=1&per-page=$totalUsers&pso-type=usr&active=$status"
+    }
+
+    try {
+        $response = Invoke-RestMethod -Uri $url -Headers $headers
+        return $response.data.data.id
+    } catch {
+        Write-Host "❌ Failed to retrieve $label user list." -ForegroundColor Red
+        return @()
+    }
+}
+
+# Trigger both user lists
+$UserIds_Active   = Get-UserIds -Active $true
+$UserIds_Inactive = Get-UserIds -Active $false
+
+# Display recap in test mode
+if ($IsTestMode) {
+    $totalTestFetched = $UserIds_Active.Count + $UserIds_Inactive.Count
+    Write-Host "`n📥 Test mode total fetched: $($UserIds_Active.Count) active + $($UserIds_Inactive.Count) inactive = $totalTestFetched users" -ForegroundColor Magenta
+}
+
+# -------------------------------------------------------
+# BLOCK 4 : PER-USER FIELD RETRIEVAL & FLATTENING
+# -------------------------------------------------------
+
+# PeopleSpheres field label mapping
+$FieldMapRaw = @{
+    "711"  = "Date de début dans le poste"
+    "2637" = "[YOUZER] Date d'embauche"
+    "683"  = "Départ de la société"
+    "2638" = "[YOUZER] Date de sortie"
+    "1145" = "Type collaboration"
+    "125"  = "Nom"
+    "123"  = "Prénom"
+    "423"  = "Image de profil"
+    "550"  = "Civilité"
+    "28"   = "Adresse e-mail professionnelle"
+    "27"   = "Téléphone portable professionnel"
+    "182"  = "Responsable"
+    "344"  = "Service"
+    "185"  = "Poste"
+    "186"  = "Entité Légale"
+    "348"  = "Site"
+    "859"  = "Matricule"
+}
+
+# Normalize keys from labels
+$FieldMap = @{}
+foreach ($kvp in $FieldMapRaw.GetEnumerator()) {
+    $FieldMap[$kvp.Key] = Normalize-Label $kvp.Value
+}
+
+# Function to retrieve and flatten user data
+function Get-FlattenedUserData {
+    param (
+        [array]$UserIds,
+        [string]$UserType  # "active" or "inactive"
+    )
+
+    $result = @()
+    $unknownFieldIds = @{}
+    $counter = 1
+    $total = $UserIds.Count
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    foreach ($userId in $UserIds) {
+        Write-Host "[$counter/$total] [$UserType] Fetching user ID $userId..." -ForegroundColor Cyan
+        $counter++
+
+        try {
+            $stopwatch.Restart()
+            $url = "$BaseApiUrl/psos/$userId/fields?active=true&include=type,items,options,settings,assignment_settings"
+            $fields = (Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders)).data
+            $stopwatch.Stop()
+
+            $userData = [ordered]@{}
+            $userData["dateexescript"] = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+
+            # Prepare display values
+            $prenom = ""
+            $nom = ""
+            $email = ""
+            $jobtitle = ""
+            $entite = ""
+
+            foreach ($item in $fields) {
+                $idStr = "$($item.id)"
+                $value = $item.value_details
+
+                if ($FieldMap.ContainsKey($idStr)) {
+                    $key = $FieldMap[$idStr]
+
+                    if ($idStr -eq "182" -and $value -is [psobject]) {
+                        $userData[$key] = $value.professional_email
+                    } elseif ($value -is [array]) {
+                        $userData[$key] = ($value -join ", ")
+                    } elseif ($value -is [psobject]) {
+                        $userData[$key] = $value.ToString()
+                    } else {
+                        $userData[$key] = $value
+                    }
+
+                    switch ($key) {
+                        "prenom"         { $prenom  = $userData[$key] }
+                        "nom"            { $nom     = $userData[$key] }
+                        "adresse_email_professionnelle" { $email = $userData[$key] }
+                        "poste"          { $jobtitle = $userData[$key] }
+                        "entite_legale"  { $entite  = $userData[$key] }
+                    }
+                }
+                else {
+                    if (-not $unknownFieldIds.ContainsKey($idStr)) {
+                        $unknownFieldIds[$idStr] = @{
+                            label = $item.label
+                            type  = $item.type
+                            user  = $userId
+                        }
+                    }
+                }
+            }
+
+            # Ensure every expected key is present in the final object
+            foreach ($expectedKey in $FieldMap.Values) {
+                if (-not $userData.Contains($expectedKey)) {
+                    $userData[$expectedKey] = ""
+                }
+            }
+
+            # 🔤 UTF-8 normalization for string fields
+            # Reason: Avoids encoding issues when exporting CSV (e.g., "M+üRCIA" instead of "MÚRCIA")
+            # Issue: Modifying values while iterating on a live dictionary (Keys) causes exceptions
+            # Fix: Use `.Keys.Clone()` to iterate over a safe static copy of keys
+            foreach ($key in $userData.Keys.Clone()) {
+                if ($userData[$key] -is [string]) {
+                    $userData[$key] = [System.Text.Encoding]::UTF8.GetString(
+                        [System.Text.Encoding]::UTF8.GetBytes($userData[$key])
+                    )
+                }
+            }
+
+            $result += [PSCustomObject]$userData
+
+            $displayBlock = @"
+------------------------------
+👤 $prenom $nom
+📧 $email
+🏢 $entite
+🏷  $jobtitle
+------------------------------
+"@
+            Write-Host $displayBlock -ForegroundColor DarkCyan
+        }
+        catch {
+            $message = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ❌ [$UserType] ERROR for user $userId : $($_.Exception.Message)"
+            Write-Host $message -ForegroundColor Red
+            Add-Content -Path $script:LogPath -Value $message
+            $script:HadErrors = $true
+        }
+
+        # Refresh token if older than 4 minutes
+        if ((New-TimeSpan -Start $TokenTime).TotalMinutes -ge 4) {
+            $global:TokenRefreshCount++
+            Refresh-AccessToken
+            Show-TokenRefreshedBanner -startTime $scriptStartTime -refreshCount $global:TokenRefreshCount
+        }
+    }
+
+    # Notify if new unknown field IDs detected
+    if ($unknownFieldIds.Count -gt 0) {
+        $body = "<p><strong>New unknown field IDs detected in PeopleSpheres API:</strong></p><ul>"
+        foreach ($k in $unknownFieldIds.Keys) {
+            $info = $unknownFieldIds[$k]
+            $body += "<li><b>ID:</b> $k | <b>Label:</b> $($info.label) | <b>Type:</b> $($info.type) | <b>User ID:</b> $($info.user)</li>"
+        }
+        $body += "</ul><p>Please review and update the script field mappings if needed.</p>"
+
+        IADAdmin_SendMailMessage -To "jeremie.poujol@iadinternational.com" `
+                                 -Subject "[iadlife] New API Field IDs detected in PeopleSpheres" `
+                                 -Body $body -BodyAsHtml
+    }
+
+    return $result
+}
+
+# Process active and inactive users separately
+$ResultActive   = Get-FlattenedUserData -UserIds $UserIds_Active   -UserType "active"
+$ResultInactive = Get-FlattenedUserData -UserIds $UserIds_Inactive -UserType "inactive"
+
+# -------------------------------------------------------
+# BLOCK 5 : CSV EXPORT (UTF-8 WITH BOM to avoid encoding issues)
+# -------------------------------------------------------
+
+# 💡 WHY THIS CHANGE?
+# Export-Csv with -Encoding UTF8 uses UTF-8 *without* BOM (Byte Order Mark),
+# which can cause special characters (like í, ñ, ó, etc.) to appear incorrectly
+# in Excel or downstream processing tools. Using .NET's UTF8Encoding($true)
+# ensures a BOM is added to the CSV, making encoding explicit and Excel-safe.
+
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+
+# Active users - timestamped
+try {
+    [System.IO.File]::WriteAllLines($script:CsvActive_Timestamped, ($ResultActive | ConvertTo-Csv -NoTypeInformation), $utf8Bom)
+    Write-Host "✅ Active users exported (timestamped, UTF-8 BOM): $($script:CsvActive_Timestamped)" -ForegroundColor Green
+} catch {
+    Write-Host "❌ Failed to export active users: $_" -ForegroundColor Red
+    $script:HadErrors = $true
+}
+
+# Inactive users - timestamped
+try {
+    [System.IO.File]::WriteAllLines($script:CsvInactive_Timestamped, ($ResultInactive | ConvertTo-Csv -NoTypeInformation), $utf8Bom)
+    Write-Host "✅ Inactive users exported (timestamped, UTF-8 BOM): $($script:CsvInactive_Timestamped)" -ForegroundColor Green
+} catch {
+    Write-Host "❌ Failed to export inactive users: $_" -ForegroundColor Red
+    $script:HadErrors = $true
+}
+
+# Azure SQL version - fixed name
+try {
+    [System.IO.File]::WriteAllLines($script:CsvAzure_NoTimestamp, ($ResultActive | ConvertTo-Csv -NoTypeInformation), $utf8Bom)
+    Write-Host "✅ Active users exported (fixed path, UTF-8 BOM): $($script:CsvAzure_NoTimestamp)" -ForegroundColor Green
+} catch {
+    Write-Host "❌ Failed to export fixed-named CSV: $_" -ForegroundColor Red
+    $script:HadErrors = $true
+}
+
+# -------------------------------------------------------
+# BLOCK 6 : EMAIL SENDING (With Summary + ASCII Recap)
+# -------------------------------------------------------
+
+# Determine elapsed time
+$scriptEndTime = Get-Date
+$duration = $scriptEndTime - $scriptStartTime
+$durationStr = $duration.ToString("hh\:mm\:ss")
+
+# Compose HTML body with summary
+$finalBody = @"
+<p>Hello,</p>
+<p>The PeopleSpheres export job completed successfully.</p>
+
+<h3>Summary</h3>
+<ul>
+    <li><b>Total active users:</b> $($ResultActive.Count)</li>
+    <li><b>Total inactive users:</b> $($ResultInactive.Count)</li>
+    <li><b>Token refresh count:</b> $TokenRefreshCount</li>
+    <li><b>Total duration:</b> $durationStr</li>
+</ul>
+
+<h3>Exported CSV files</h3>
+<ul>
+    <li><b>Active users (timestamped):</b> <a href="file:///$($script:CsvActive_Timestamped -replace '\\', '/')">$($script:CsvActive_Timestamped)</a></li>
+    <li><b>Inactive users (timestamped):</b> <a href="file:///$($script:CsvInactive_Timestamped -replace '\\', '/')">$($script:CsvInactive_Timestamped)</a></li>
+    <li><b>Active users (fixed path):</b> <a href="file:///$($script:CsvAzure_NoTimestamp -replace '\\', '/')">$($script:CsvAzure_NoTimestamp)</a></li>
+</ul>
+"@
+
+# Optional ASCII recap in console (not in the email)
+$asciiBanner = @"
+╔═════════════════════════════════════════════════════════╗
+║           ✅ PEOPLESPHERES EXPORT COMPLETED            ║
+╠═════════════════════════════════════════════════════════╣
+║ 📂 Active users exported   : $($ResultActive.Count.ToString().PadRight(25))║
+║ 📂 Inactive users exported : $($ResultInactive.Count.ToString().PadRight(25))║
+║ 🔁 Token refresh count     : $($TokenRefreshCount.ToString().PadRight(25))║
+║ ⏱  Duration                : $durationStr                        ║
+╚═════════════════════════════════════════════════════════╝
+"@
+Write-Host $asciiBanner -ForegroundColor Green
+
+if ($TokenRefreshCount -gt 3) {
+    Write-Host "⚠ Warning: Token was refreshed $TokenRefreshCount times – check performance." -ForegroundColor Red
+}
+
+# Append script signature
+$finalBody += IADAdmin_AddScriptSignature
+
+# Compose subject
+$emailSubject = "[iadlife] PeopleSpheres Export – $($scriptEndTime.ToString('yyyy-MM-dd'))"
+
+# Define recipients
+$IsTestMode = $true  # Set to $false in production
+
+$prodRecipients = @{
+    To  = @("exploitation.notify@iadinternational.com")
+    Cc  = @("alexandre.kebaili-ext@iadinternational.com")
+    Bcc = "986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms"
+}
+
+$testRecipients = @{
+    To  = @("jeremie.poujol@iadinternational.com")
+    Cc  = @("jeremie.poujol@iadinternational.com")
+    Bcc = "986c2ea3.iadgroup.onmicrosoft.com@fr.teams.ms"
+}
+
+$emailRecipients = if ($IsTestMode) { $testRecipients } else { $prodRecipients }
+
+# Send email
+try {
+    if ([string]::IsNullOrWhiteSpace($finalBody)) {
+        Write-Warning "❗ Email not sent: email body is empty."
+    } else {
+        IADAdmin_SendMailMessage -Body $finalBody 
+                                 -To $emailRecipients.To 
+                                 -Cc $emailRecipients.Cc 
+                                 -Bcc $emailRecipients.Bcc 
+                                 -Subject $emailSubject 
+                                 -BodyAsHtml
+        Write-Host "📧 Email successfully sent to: $($emailRecipients.To -join ', ')" -ForegroundColor Green
+    }
+} catch {
+    Write-Host "❌ Failed to send summary email: $_" -ForegroundColor Red
+    $script:HadErrors = $true
+}
+
+# ----------------------------------------------
+# BLOCK 7 : ALERT FOR UNMAPPED PEOPLESPHERES FIELD IDS
+# ----------------------------------------------
+
+# -------------------------------------------------------
+# BLOCK 7 : ALERT FOR UNMAPPED PEOPLESPHERES FIELD IDS
+# -------------------------------------------------------
+
+# List to store unmapped field IDs with associated user info
+$unmappedFieldDetails = @()
+
+# ID to ignore (service account with elevated access – sees extra internal fields)
+$excludedUserIds = @(529)  # ← This account sees everything, ignore it on purpose
+
+# Re-scan all users (active + inactive) for unmapped field IDs
+foreach ($userId in ($UserIds_Active + $UserIds_Inactive)) {
+    if ($excludedUserIds -contains $userId) {
+        continue  # Skip known service/system accounts
+    }
+
+    try {
+        $url = "$BaseApiUrl/psos/$userId/fields?active=true&include=type,items,options,settings,assignment_settings"
+        $fields = (Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders)).data
+
+        foreach ($item in $fields) {
+            $fieldId = "$($item.id)"
+
+            if (-not $FieldMap.ContainsKey($fieldId)) {
+                $unmappedFieldDetails += [PSCustomObject]@{
+                    UserId   = $userId
+                    FieldId  = $fieldId
+                    Label    = if ($item.label) { $item.label } else { "(empty)" }
+                    Type     = if ($item.type.name) { $item.type.name } else { $item.type.alias }
+                }
+            }
+        }
+    } catch {
+        Write-Warning "⚠️ Failed to scan unmapped fields for user ID $userId"
+    }
+}
+
+# If unmapped fields found (excluding known service account), send a single alert email
+if ($unmappedFieldDetails.Count -gt 0) {
+    # Start HTML body
+    $alertBody = @"
+<p>🚨 <strong>Unmapped PeopleSpheres Field IDs Detected</strong></p>
+<p>The following field IDs were returned by the API but are not currently handled in the <code>FieldMap</code>.</p>
+<p>Note: Fields returned by service account(s) such as User ID 529 have been intentionally excluded.</p>
+
+<table border="1" cellpadding="5" cellspacing="0">
+<tr><th>User ID</th><th>Field ID</th><th>Label</th><th>Type</th></tr>
+"@
+
+    foreach ($entry in $unmappedFieldDetails) {
+        $alertBody += "<tr><td>$($entry.UserId)</td><td>$($entry.FieldId)</td><td>$($entry.Label)</td><td>$($entry.Type)</td></tr>n"
+    }
+
+    $alertBody += "</table>
+<p>Please review and update the field mappings if necessary.</p>"
+
+    try {
+        IADAdmin_SendMailMessage -Body $alertBody 
+                                 -To "jeremie.poujol@iadinternational.com" 
+                                 -Subject "[iadlife] 🔎 PeopleSpheres – Unmapped Field IDs Detected" 
+                                 -BodyAsHtml
+        Write-Host "📧 Global alert email sent for unmapped field IDs." -ForegroundColor Magenta
+    } catch {
+        Write-Host "❌ Failed to send unmapped fields alert email: $_" -ForegroundColor Red
+        $script:HadErrors = $true
+    }
+}
+
+# -------------------------------------------------------
+# BLOCK 8 : ERROR NOTIFICATION (if any error occurred)
+# -------------------------------------------------------
+
+if ($script:HadErrors -and (Test-Path $script:LogPath)) {
+    $logLastWrite = (Get-Item $script:LogPath).LastWriteTime
+    $logAgeHours  = (New-TimeSpan -Start $logLastWrite -End (Get-Date)).TotalHours
+
+    if ($logAgeHours -le 12) {
+        $subject = "[iadlife] ❌ Script Failure – PeopleSpheres Export"
+        $body = @"
+<p>⚠️ Hello Jérémie,</p>
+<p>The PeopleSpheres export script encountered one or more errors during its execution.</p>
+<p>Please review the log file located at the following path:</p>
+<pre><code>$($script:LogPath)</code></pre>
+<p>The log file has been attached to this email for your convenience.</p>
+<p>This is an automated alert generated by the export script.</p>
+"@
+
+        try {
+            IADAdmin_SendMailMessage -To "jeremie.poujol@iadinternational.com" 
+                                     -Subject $subject 
+                                     -Body $body 
+                                     -BodyAsHtml 
+                                     -Attachments $script:LogPath
+            Write-Host "📧 Error alert mail sent with attached log file." -ForegroundColor Magenta
+        } catch {
+            Write-Host "❌ Failed to send error alert email with log: $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "⏱ Log file is older than 12 hours – no error alert sent." -ForegroundColor Yellow
+    }
+}
+
+# -------------------------------------------------------
+# BLOCK 9 : UPLOAD TO AZURE BLOB + BULK INSERT TO SQL
+# -------------------------------------------------------
+
+# Azure and SQL configuration
+$tenant              = "e419a47d-b189-44f1-a28e-16be83c1f11e"
+$subscription        = "f9d75155-d6d0-4867-b0c0-cec83ecea40c"
+$userTenant          = "AzSce_PSScript@iadgroup.onmicrosoft.com"
+$resourceGroupName   = "rg-frc-coreservices"
+$storageAccountName  = "iadsamgmtfrccore"
+$containerName       = "csvcontainer"
+
+$serverInstance      = "sql-frc-coreservices-iad.database.windows.net"
+$databaseName        = "iaddb"
+$sqlLogin            = "PSScript"
+$localCsvPath        = $script:CsvAzure_NoTimestamp  # should point to: E:\Powershell\03-FlatFilesStorage\AzureSQLDatabase_csv\GenerateCSV-API-PeopleSpheres.csv
+$blobName            = "GenerateCSV-API-PeopleSpheres.csv"
+
+# Load secure credentials for Azure authentication
+$securePathAzure = "C:\Scripts\SecureString\$userTenant.$env:USERNAME.securestring"
+if (-not (Test-Path $securePathAzure)) {
+    Read-Host "Enter password for $userTenant" -AsSecureString |
+        ConvertFrom-SecureString |
+        Out-File -FilePath $securePathAzure
+}
+$securePasswordAzure = Get-Content $securePathAzure | ConvertTo-SecureString
+$credAzure = New-Object System.Management.Automation.PSCredential ($userTenant, $securePasswordAzure)
+
+# Connect to Azure
+Connect-AzAccount -Credential $credAzure -Tenant $tenant -Subscription $subscription
+
+# Get storage context
+$storageAccount = Get-AzStorageAccount -ResourceGroupName $resourceGroupName -StorageAccountName $storageAccountName
+$context = $storageAccount.Context
+
+# Upload CSV to blob
+try {
+    Set-AzStorageBlobContent -Container $containerName -Blob $blobName -File $localCsvPath -Context $context -Force
+    Write-Host "✅ CSV successfully uploaded to Azure Blob Storage: $blobName" -ForegroundColor Green
+} catch {
+    Write-Host "❌ Failed to upload CSV to blob: $_" -ForegroundColor Red
+    $script:HadErrors = $true
+}
+
+# Load secure SQL password
+$securePathSql = "C:\Scripts\SecureString\$serverInstance.$env:USERNAME.securestring"
+if (-not (Test-Path $securePathSql)) {
+    Read-Host "Enter SQL SA password for $serverInstance" -AsSecureString |
+        ConvertFrom-SecureString |
+        Out-File -FilePath $securePathSql
+}
+$securePasswordSql = Get-Content $securePathSql | ConvertTo-SecureString
+$sqlCredential = New-Object System.Management.Automation.PSCredential ($sqlLogin, $securePasswordSql)
+$sqlPassword = $sqlCredential.GetNetworkCredential().Password
+
+# BULK INSERT SQL command
+$bulkInsertQuery = @"
+TRUNCATE TABLE dbo.PEOPLESPHERE_Iad;
+BULK INSERT dbo.PEOPLESPHERE_Iad
+FROM 'csvcontainer/GenerateCSV-API-PeopleSpheres.csv'
+WITH (
+    DATA_SOURCE = 'blobcontainer',
+    FIRSTROW = 2,
+    FORMAT = 'CSV'
+);
+"@
+
+# Execute query
+$sqlParams = @{
+    ServerInstance     = $serverInstance
+    Database           = $databaseName
+    Username           = $sqlLogin
+    Password           = $sqlPassword
+    Query              = $bulkInsertQuery
+    EncryptConnection  = $true
+    OutputSqlErrors    = $true
+}
+try {
+    Invoke-Sqlcmd @sqlParams
+    Write-Host "✅ BULK INSERT completed into dbo.PEOPLESPHERE_Iad" -ForegroundColor Green
+} catch {
+    Write-Host "❌ SQL BULK INSERT failed: $_" -ForegroundColor Red
+    $script:HadErrors = $true
+}
+
+<#
+-- SQL Server Management Studio (SSMS) - Table structure for dbo.PEOPLESPHERE_Iad
+
+CREATE TABLE dbo.PEOPLESPHERE_Iad (
+    Datededebutdansleposte                VARCHAR(255),
+    Youzerdatedembauche                   VARCHAR(255),
+    Departdelasociete                     VARCHAR(255),
+    Youzerdatedesortie                    VARCHAR(255),
+    Typecollaboration                     VARCHAR(255),
+    Nom                                   VARCHAR(255),
+    Prenom                                VARCHAR(255),
+    Imagedeprofil                         VARCHAR(255),
+    Civilite                              VARCHAR(255),
+    Adresseemailprofessionnelle           VARCHAR(255),
+    Telephoneportableprofessionnel        VARCHAR(255),
+    Responsable                           VARCHAR(255),
+    Service                               VARCHAR(255),
+    Poste                                 VARCHAR(255),
+    Entitelegale                          VARCHAR(255),
+    Site                                  VARCHAR(255),
+    Matricule                             VARCHAR(255),
+    DateExeScript                         VARCHAR(255)
+)
 #>
